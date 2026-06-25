@@ -318,9 +318,10 @@ def _get_ops(cur, tables, posts, posts_live):
 
 
 # ------------------------------------------------------------------------ public API
-def get_state(limit=12):
+def get_state(limit=60):
     """The whole payload the dashboard polls. Never raises — on any DB error it
-    degrades to mock and reports the error string so the demo never white-screens."""
+    degrades to mock and reports the error string so the demo never white-screens.
+    (limit=60 so onboarded agents' posts aren't pushed out of the feed window.)"""
     mode, url = _mode()
     generated_at = _iso(_now())
 

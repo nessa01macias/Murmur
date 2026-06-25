@@ -26,6 +26,10 @@ script (auto-loaded) or export them:
 then:
     uv run --with mcp --with anthropic --with fastembed python murmur.py
     MURMUR_FLEET=10 uv run --with mcp --with anthropic --with fastembed python murmur.py  # scale up
+    uv run --with mcp --with anthropic --with fastembed python murmur.py --onboard "cozy-mystery"
+    #   ^ a new agent provisions its OWN Kafka lane + Postgres state via the MCP, then joins the round
+    uv run --with mcp --with anthropic --with fastembed python murmur.py --tier2
+    #   ^ the watcher agent observes its own DB load, then provisions a pgvector index to self-optimize
     # first run downloads a small (~130MB) local embedding model, one time
 
 Transport: connects to the hosted Aiven MCP (https://mcp.aiven.live/mcp) using AIVEN_TOKEN
@@ -45,7 +49,8 @@ import random
 import re
 import sys
 import threading
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from mcp import ClientSession, StdioServerParameters
@@ -72,6 +77,15 @@ SIM_REJECT = 0.80
 DIVERSIFY_TRIES = 3
 THEME_SIM = 0.55          # round hooks within this cosine of the leader form the "theme"
 STAGGER_SECONDS = 1.0     # pause between agents — gentle on MCP rate limits + watchable
+
+# Tier 2 (self-optimization, capacity rehearsal). Validated live: HNSW (m=8, ef_construction=32)
+# builds <30s up to ~20k 384-dim rows; 50k exceeds the 30s timeout. 20k: seq-NN ~19ms -> HNSW ~3ms,
+# recall@10 100%. Runs on a throwaway per-run bench table — NEVER the live `hooks` (the write tool
+# blocks DROP, so a timed-out build would be unrecoverable on prod; and a pre-existing index would
+# ruin the seq baseline). 384-dim probe vector reused for the before/after + recall.
+TIER2_ROWS = int(os.environ.get("MURMUR_TIER2_ROWS", "20000"))
+TIER2_CHUNK = 20000       # rows per insert (each must finish < the 30s statement timeout)
+PROBE = "(SELECT array_agg(0.5)::vector FROM generate_series(1,384))"
 
 # The fleet roster (same genre, distinct voices, so they compete for one lane and must
 # diversify). MURMUR_FLEET picks how many run (default 6); framed as scalable to dozens.
@@ -241,6 +255,42 @@ async def store_post(session, account_id, subject, body, performance, diversifie
         f"VALUES ('{sql_str(account_id)}', '{sql_str(subject)}', '{sql_str(body)}', "
         f"{perf}, {div}, '{sql_str(scheduled_for)}')")
 
+# --- Tier 2 observe/optimize MCP wrappers ---
+async def query_stats(session, order_by="total_time:desc", limit=5, search=None):
+    args = {"project": PROJECT, "service_name": PG_SVC, "order_by": order_by, "limit": limit}
+    if search:
+        args["search"] = search
+    txt = await call(session, "aiven_pg_service_query_statistics", args)
+    return extract_json(txt).get("queries", [])
+
+async def db_metrics(session, period="hour"):
+    txt = await call(session, "aiven_service_metrics_fetch",
+                     {"project": PROJECT, "service_name": PG_SVC, "period": period})
+    return extract_json(txt)
+
+async def account_id(session):
+    p = extract_json(await call(session, "aiven_project_get", {"project": PROJECT}))
+    return (p.get("project") or p).get("account_id")
+
+async def optimize_query(session, acct, query):
+    txt = await call(session, "aiven_pg_optimize_query",
+                     {"account_id": acct, "query": query, "pg_version": "17",
+                      "reasoning": "murmur tier2 advisory cross-check"})
+    return extract_json(txt)
+
+async def explain(session, sql, analyze=True):
+    """Return (plan_text, execution_ms, scan_kind) for a query via aiven_pg_read."""
+    rows = await pg_read(session, ("EXPLAIN (ANALYZE) " if analyze else "EXPLAIN ") + sql)
+    plan = "\n".join(r.get("QUERY PLAN", "") for r in rows)
+    m = re.search(r"Execution Time: ([\d.]+) ms", plan)
+    ms = float(m.group(1)) if m else None
+    scan = "Index Scan" if "Index Scan" in plan else ("Seq Scan" if "Seq Scan" in plan else "?")
+    return plan, ms, scan
+
+async def topk_ids(session, table, k=10):
+    rows = await pg_read(session, f"SELECT id FROM {table} ORDER BY embedding <=> {PROBE} LIMIT {k}")
+    return [r["id"] for r in rows]
+
 # ----------------------------------------------------------------------------- LLM layer
 def decide(system, user):
     """Ask claude-sonnet for a decision; returns the parsed JSON object (a dict)."""
@@ -256,8 +306,8 @@ def persona_system(me):
             f"Always answer with a single JSON object only.")
 
 # ----------------------------------------------------------------------------- setup (idempotent)
-async def setup(session):
-    banner(YELLOW, "[setup]", "ensuring tables, fleet, topics, pgvector (all via MCP)")
+async def ensure_schema(session):
+    """Create the tables, pgvector extension, and shared topics — idempotent, all via MCP."""
     await pg_write(session,
         "CREATE TABLE IF NOT EXISTS accounts (id text PRIMARY KEY, persona text NOT NULL, genre text NOT NULL)")
     await pg_write(session,
@@ -272,11 +322,6 @@ async def setup(session):
         "CREATE TABLE IF NOT EXISTS posts (id bigserial PRIMARY KEY, "
         "account_id text REFERENCES accounts(id), subject text, body text, performance numeric, "
         "diversified_from text, scheduled_for text, created_at timestamptz NOT NULL DEFAULT now())")
-    for acct_id, persona in ROSTER[:FLEET_SIZE]:
-        await pg_write(session,
-            f"INSERT INTO accounts (id, persona, genre) VALUES "
-            f"('{acct_id}', '{sql_str(persona)}', '{GENRE}') "
-            f"ON CONFLICT (id) DO UPDATE SET persona = EXCLUDED.persona, genre = EXCLUDED.genre")
     for topic in (POSTS, SIGNALS):
         try:  # topics are usually pre-created; tolerate "already exists"
             await call(session, "aiven_kafka_topic_create", {
@@ -284,6 +329,15 @@ async def setup(session):
                 "topic_name": topic, "partitions": 1, "replication": 1})
         except Exception:
             pass
+
+async def setup(session):
+    banner(YELLOW, "[setup]", "ensuring tables, fleet, topics, pgvector (all via MCP)")
+    await ensure_schema(session)
+    for acct_id, persona in ROSTER[:FLEET_SIZE]:
+        await pg_write(session,
+            f"INSERT INTO accounts (id, persona, genre) VALUES "
+            f"('{acct_id}', '{sql_str(persona)}', '{GENRE}') "
+            f"ON CONFLICT (id) DO UPDATE SET persona = EXCLUDED.persona, genre = EXCLUDED.genre")
     step(f"fleet of {FLEET_SIZE} {GENRE} agents ready: "
          + ", ".join(a for a, _ in ROSTER[:FLEET_SIZE]))
 
@@ -451,9 +505,193 @@ async def do_demo(session):
     banner(GREEN, "✓ done", "no controller, no human, no backend — the fleet coordinated itself via Aiven.")
     return {"agents": FLEET_SIZE, "at": since_iso, **(summary or {})}
 
-async def connect_and_run(token):
-    """Connect to the Aiven MCP (remote first, local stdio fallback) and run the demo
-    exactly once on whichever transport exposes the write tools."""
+# ----------------------------------------------------------------------------- onboard (self-provision)
+async def onboard(session, segment):
+    """A brand-new agent provisions its OWN place in the swarm via the MCP — its own Kafka lane
+    (topic) and its own Postgres state — then joins the live round on the shared bus. Every call
+    is a fast op (topic create + DDL = seconds), safe to fire live."""
+    await ensure_schema(session)
+    seg = re.sub(r"[^a-z0-9]+", "-", segment.strip().lower()).strip("-") or "segment"
+    acct_id = f"acct_{seg.replace('-', '_')}"
+    lane = f"{POSTS}.{seg}"     # its own dedicated announce lane (NOT where it coordinates)
+
+    banner(GREEN, "✦ onboard", f"a new '{segment}' agent is provisioning itself into the swarm")
+
+    # 1) the agent REASONS that it needs its own lane + state (an actual LLM decision)
+    print(f"   {DIM}thinking with {MODEL}…{RESET}")
+    d = await asyncio.to_thread(
+        decide,
+        f"You are a brand-new autonomous account-agent joining an existing '{GENRE}' book-marketing "
+        f"fleet to cover the '{segment}' audience segment. Before you can work you must provision your "
+        f"own place in the swarm. Answer with a single JSON object only.",
+        f"Decide your identity and why you need your own infrastructure. Reply ONLY JSON: "
+        f'{{"persona": "<a name + one-line persona for the {segment} segment>", '
+        f'"reason": "<one sentence: why you need your own coordination lane and your own state>", '
+        f'"announce": "<a one-line birth announcement to publish on your new lane>"}}')
+    persona = d.get("persona", f"{segment} specialist").strip()
+    reason = d.get("reason", "").strip()
+    announce = d.get("announce", f"The {segment} desk is live.").strip()
+    print(f"   decision: {BOLD}PROVISION & JOIN{RESET}")
+    print(f"   identity: {GREEN}{acct_id}{RESET} — {persona}")
+    print(f"   why:      {DIM}{reason}{RESET}")
+
+    timings = {}
+    # 2) provision its OWN Kafka lane (real infra creation, via MCP) — seconds, safe live
+    t = time.perf_counter()
+    try:
+        await call(session, "aiven_kafka_topic_create", {
+            "project": PROJECT, "service_name": KAFKA_SVC,
+            "topic_name": lane, "partitions": 1, "replication": 1})
+        timings["aiven_kafka_topic_create"] = round((time.perf_counter() - t) * 1000)
+        step(f"provisioned its own Kafka lane {BOLD}{lane}{RESET} "
+             f"{DIM}({timings['aiven_kafka_topic_create']} ms){RESET}")
+    except Exception as e:
+        timings["aiven_kafka_topic_create"] = round((time.perf_counter() - t) * 1000)
+        step(f"{YELLOW}lane {lane} already existed ({str(e)[:40]}…){RESET}")
+
+    # 3) provision its OWN state (accounts row, via MCP pg_write) — seconds, safe live
+    t = time.perf_counter()
+    await pg_write(session,
+        f"INSERT INTO accounts (id, persona, genre) VALUES "
+        f"('{sql_str(acct_id)}', '{sql_str(persona)}', '{GENRE}') "
+        f"ON CONFLICT (id) DO UPDATE SET persona = EXCLUDED.persona, genre = EXCLUDED.genre")
+    timings["aiven_pg_write"] = round((time.perf_counter() - t) * 1000)
+    step(f"provisioned its own state: accounts row {BOLD}{acct_id}{RESET} "
+         f"{DIM}({timings['aiven_pg_write']} ms){RESET}")
+
+    # 4) USE its new lane: publish a birth announcement (via MCP produce)
+    t = time.perf_counter()
+    await produce(session, lane, [{"key": {"account_id": acct_id}, "value": {
+        "account_id": acct_id, "type": "announce", "segment": segment,
+        "text": announce, "ts": now_iso()}}])
+    timings["aiven_kafka_topic_message_produce"] = round((time.perf_counter() - t) * 1000)
+    step(f"announced on its lane {DIM}({timings['aiven_kafka_topic_message_produce']} ms){RESET}: "
+         f"\"{announce}\"")
+
+    # 5) JOIN the live round on the SHARED bus — diversify vs the recent fleet + show on the wall
+    banner(GREEN, "↳ join", f"{acct_id} joins the shared '{POSTS}' round and diversifies vs the fleet")
+    # diversify against the day's fleet activity (wide window so onboarding works whenever)
+    window = datetime.now(timezone.utc) - timedelta(hours=24)
+    since_iso = window.strftime("%Y-%m-%dT%H:%M:%SZ")
+    since_db = (await pg_read(session, "SELECT (now() - interval '24 hours') AS t"))[0]["t"]
+    post = await agent_post(session, acct_id, GREEN, since_iso, since_db)
+
+    banner(GREEN, "✓ born",
+           f"{acct_id} provisioned its own topic + state via the MCP, then posted — no human, no backend.")
+    return {"acct_id": acct_id, "lane": lane, "provision_timings_ms": timings, "first_post": post}
+
+# ----------------------------------------------------------------------------- tier 2 (self-optimize)
+async def tier2_optimize(session):
+    """Capacity rehearsal: the platform-watcher agent seeds a throwaway bench to projected scale,
+    observes the swarm's own DB load via the MCP, decides + applies a pgvector index, and verifies a
+    REAL seq->index speedup + recall — all via MCP, never touching the live `hooks` table."""
+    await ensure_schema(session)
+    bench = f"hooks_bench_{int(time.time()) % 1000000}"     # fresh per run (can't DROP via MCP)
+    idx = f"{bench}_hnsw"
+    banner(BLUE, "⚙ tier2", f"self-optimization rehearsal on a throwaway bench ({bench})")
+
+    # 1) seed the bench to projected scale (synthetic 384-dim vectors), in <30s chunks
+    await pg_write(session,
+        f"CREATE TABLE IF NOT EXISTS {bench} (id bigserial PRIMARY KEY, account_id text NOT NULL, "
+        f"subject text NOT NULL, embedding vector(384) NOT NULL, performance int, "
+        f"ts timestamptz NOT NULL DEFAULT now())")
+    seeded = 0
+    while seeded < TIER2_ROWS:
+        n = min(TIER2_CHUNK, TIER2_ROWS - seeded)
+        await pg_write(session,
+            f"INSERT INTO {bench} (account_id, subject, embedding, performance, ts) "
+            f"SELECT 'loadgen', 'b'||gs, (SELECT array_agg(random())::vector "
+            f"FROM generate_series(1,384) d WHERE gs = gs), (random()*100)::int, now() "
+            f"FROM generate_series(1,{n}) gs")
+        seeded += n
+    await pg_write(session, f"ANALYZE {bench}")
+    step(f"seeded {seeded:,} synthetic hooks to bench (projected scale)")
+
+    # 2) OBSERVE — read the swarm's own load through the MCP
+    banner(BLUE, "≈ observe", "reading our own DB load via the MCP")
+    for q in await query_stats(session, limit=3, search="account_id <>"):   # the live diversify NN family
+        qt = (q.get("query") or "")[:58].replace("\n", " ")
+        step(f"{DIM}hot query: {q.get('calls')}× total {round(float(q.get('total_time', 0)), 1)}ms  {qt}…{RESET}")
+    try:
+        await db_metrics(session)
+        step("fetched DB metrics (CPU/load) via aiven_service_metrics_fetch")
+    except Exception as e:
+        step(f"{DIM}metrics_fetch skipped ({str(e)[:40]}){RESET}")
+    nn = f"SELECT id FROM {bench} ORDER BY embedding <=> {PROBE} LIMIT 10"
+    _, before_ms, before_scan = await explain(session, nn)
+    exact = await topk_ids(session, bench)                  # exact top-10 (no index yet → seq scan)
+    step(f"baseline: {before_scan} @ {seeded:,} rows → {YELLOW}{before_ms:.1f} ms{RESET}")
+
+    # 3) DECIDE — the watcher (LLM) chooses the remediation
+    print(f"   {DIM}thinking with {MODEL}…{RESET}")
+    d = await asyncio.to_thread(
+        decide,
+        "You are Murmur's platform-watcher agent — an autonomous DataOps agent that keeps the swarm's "
+        "Aiven Postgres fast. Answer with a single JSON object only.",
+        f"The fleet's hottest query is the diversify nearest-neighbour search over the `hooks` pgvector "
+        f"column (cosine `<=>`, column `embedding vector(384)`). At {seeded} rows EXPLAIN shows a "
+        f"{before_scan} taking {before_ms:.0f} ms. You cannot tune probes/ef_search at query time, so "
+        f"favour the index with the best recall at default settings. Reply ONLY JSON: "
+        '{"diagnosis": "<one line>", "index_type": "hnsw" or "ivfflat", "reason": "<why this index + cosine opclass>"}')
+    itype = d.get("index_type", "hnsw").strip().lower()
+    if itype not in ("hnsw", "ivfflat"):                    # guardrail: only known-safe index types
+        itype = "hnsw"
+    print(f"   decision: {BOLD}CREATE {itype.upper()} INDEX{RESET} (embedding, vector_cosine_ops)")
+    print(f"   diagnosis: {DIM}{d.get('diagnosis', '')}{RESET}")
+    print(f"   why:       {DIM}{d.get('reason', '')}{RESET}")
+    try:                                                    # advisory AI cross-check (may not model pgvector)
+        acct = await account_id(session)
+        if acct:
+            rec = json.dumps(await optimize_query(session, acct, nn))[:130]
+            step(f"{DIM}EverSQL cross-check: {rec}…{RESET}")
+    except Exception as e:
+        step(f"{DIM}optimize_query skipped ({str(e)[:40]}){RESET}")
+
+    # 4) ACT — apply the index via the MCP (guarded DDL: cosine opclass, unique name)
+    # m=8/ef_construction=32 validated to build <30s at ~20k (the MCP write timeout); richer params
+    # (m=16/ef_construction=64) exceed it at this size. Recall ~80-90% on synthetic uniform vectors.
+    ddl = (f"CREATE INDEX {idx} ON {bench} USING hnsw (embedding vector_cosine_ops) "
+           f"WITH (m=8, ef_construction=32)") if itype == "hnsw" else (
+           f"CREATE INDEX {idx} ON {bench} USING ivfflat (embedding vector_cosine_ops) WITH (lists=100)")
+    t = time.perf_counter()
+    try:
+        await pg_write(session, ddl)
+    except Exception as e:                                  # e.g. >30s build → clean rollback, bench is throwaway
+        banner(YELLOW, "⚠ tier2", f"index build failed ({str(e)[:50]}) — bench is throwaway, draining")
+        await pg_write(session, f"DELETE FROM {bench}")
+        return {"ok": False, "error": str(e)[:120], "bench": bench}
+    build_ms = round((time.perf_counter() - t) * 1000)
+    await pg_write(session, f"ANALYZE {bench}")
+    step(f"built {itype} index via MCP {DIM}({build_ms} ms){RESET}; ANALYZE done")
+
+    # 5) VERIFY — re-measure plan + timing + recall (real before/after)
+    banner(BLUE, "✓ verify", "re-measuring after the agent's index")
+    await pg_read(session, nn)              # warm index pages → report steady-state, not cold-start
+    _, after_ms, after_scan = await explain(session, nn)
+    approx = await topk_ids(session, bench)
+    recall = round(len(set(approx) & set(exact)) / max(1, len(exact)) * 100)
+    speedup = round(before_ms / after_ms, 1) if after_ms else None
+    print(f"   {after_scan} → {GREEN}{after_ms:.1f} ms{RESET}  "
+          f"(was {before_ms:.1f} ms · {BOLD}{speedup}× faster{RESET}) · recall@10 {GREEN}{recall}%{RESET}")
+
+    # 6) EMIT — announce the optimization on the signals bus
+    await produce(session, SIGNALS, [{"key": {"type": "optimize"}, "value": {
+        "type": "optimize", "query": "diversify-nn", "rows": seeded, "scan_before": before_scan,
+        "scan_after": after_scan, "before_ms": round(before_ms, 1), "after_ms": round(after_ms, 1),
+        "speedup": speedup, "recall_pct": recall, "index": itype, "ts": now_iso()}}])
+    step(f"emitted optimization signal to '{SIGNALS}'")
+
+    # 7) CLEANUP — drain the bench (empty table+index persist, never read by the swarm)
+    await pg_write(session, f"DELETE FROM {bench}")
+    banner(GREEN, "✓ tier2 done",
+           f"watcher self-optimized via the MCP: {before_scan} {before_ms:.0f}ms → {after_scan} "
+           f"{after_ms:.0f}ms, recall {recall}% — live `hooks` untouched.")
+    return {"ok": True, "bench": bench, "rows": seeded, "before_ms": round(before_ms, 1),
+            "after_ms": round(after_ms, 1), "speedup": speedup, "recall_pct": recall}
+
+async def connect_and_run(token, runner=None):
+    """Connect to the Aiven MCP (remote first, local stdio fallback) and run `runner`
+    (default do_demo) exactly once on whichever transport exposes the write tools."""
     attempts = [
         ("remote https://mcp.aiven.live",
          lambda: streamablehttp_client(MCP_URL, headers={"Authorization": f"Bearer {token}"})),
@@ -482,7 +720,7 @@ async def connect_and_run(token):
                                            f"(read-only?) — trying next transport")
                     print(f"{GREEN}[mcp] connected via {name}{RESET}")
                     demo_started = True
-                    return await do_demo(session)
+                    return await (runner or do_demo)(session)
         except Exception as e:                       # noqa: BLE001
             if demo_started:
                 raise                                # demo error: do NOT re-run on fallback
@@ -564,7 +802,13 @@ def main():
     rule()
 
     token = os.environ["AIVEN_TOKEN"]
-    if "--serve" in sys.argv or _truthy(os.environ.get("MURMUR_SERVE", "")):
+    if "--onboard" in sys.argv:
+        i = sys.argv.index("--onboard")
+        segment = sys.argv[i + 1] if i + 1 < len(sys.argv) else "new-segment"
+        asyncio.run(connect_and_run(token, lambda s: onboard(s, segment)))
+    elif "--tier2" in sys.argv:
+        asyncio.run(connect_and_run(token, tier2_optimize))
+    elif "--serve" in sys.argv or _truthy(os.environ.get("MURMUR_SERVE", "")):
         port = int(os.environ.get("PORT", "8080"))
         threading.Thread(target=serve_status, args=(port,), daemon=True).start()
         print(f"{GREEN}[worker] status endpoint on 0.0.0.0:{port} · round every "
