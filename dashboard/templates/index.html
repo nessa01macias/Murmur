@@ -159,7 +159,7 @@
   .proof code{color:var(--cyan)}
 
   /* ---- signals ---- */
-  .signals{gap:9px; padding:11px; display:flex; flex-direction:column}
+  .signals{flex:1; min-height:0; gap:9px; padding:11px; display:flex; flex-direction:column}
   .sig{position:relative; padding:10px 12px 10px 14px; border-radius:11px; flex:none;
     background:var(--glass2); border:1px solid var(--line); overflow:hidden}
   .sig::before{content:""; position:absolute; left:0; top:0; bottom:0; width:3px; background:var(--sc,var(--cyan))}
@@ -256,8 +256,11 @@
     </section>
 
     <section class="s-rail">
-      <h2>What they decided <span class="count" id="sigcount">—</span> <span class="hint">— on their own, no human</span></h2>
-      <div class="panel signals scroll" id="signals"></div>
+      <h2>What they decided <span class="count" id="sigcount">—</span> <span class="hint">— after each round the fleet backs its best-scoring theme with ad budget</span></h2>
+      <div class="panel">
+        <div class="signals scroll" id="signals"></div>
+        <div class="proof">budget = <code>theme avg score × $5</code> · engagement scores &amp; dollars are simulated stand-ins for a real ad platform — the <span style="color:var(--cyan)">theme detection is real pgvector</span>, the decision is the agents', no human</div>
+      </div>
     </section>
   </div>
 </main>
@@ -382,12 +385,14 @@ function render(s){
     const key=k+"|"+(x.ts||"")+"|"+(p.theme||p.query||""); nowS.add(key);
     const isNew=!first&&!seenSigs.has(key);
     let head, body, sub="";
-    if(k==="trend"){ head="📈 A theme is catching on";
-      body='“'+esc(p.theme)+'” is resonating across the fleet';
-      sub='avg score '+esc(p.avg_performance)+'/100 · '+((p.members||[]).length)+' agents agree · spotted by the swarm, no human'; }
-    else if(k==="amplify"){ head="💰 Spending ad budget on a winner";
+    if(k==="trend"){ head="📊 Winning theme detected";
+      body='“'+esc(p.theme)+'” scored highest this round';
+      sub='avg engagement '+esc(p.avg_performance)+'/100 · '+((p.members||[]).length)+' posts on this theme · found by pgvector, no human'; }
+    else if(k==="amplify"){ head="💰 Backed it with ad budget";
       body='<span class="big">$'+esc(p.budget_usd)+'</span> behind “'+esc(p.theme)+'”';
-      sub=esc(p.account_id)+' decided this · '+esc(p.reason||""); }
+      sub = (p.score!=null)
+          ? 'theme scored '+esc(p.score)+'/100 → budget = score × $'+esc(p.per_point||5)+' · '+esc(p.account_id)+' decided, no human'
+          : esc(p.account_id)+' decided this · '+esc(p.reason||""); }
     else if(k==="optimize"){ head="⚙️ An agent sped up its own database";
       body='made its search <b style="color:var(--green)">'+esc(p.speedup)+'× faster</b> — by itself';
       sub=esc(p.scan_before)+' '+esc(p.before_ms)+'ms → '+esc(p.scan_after)+' '+esc(p.after_ms)+'ms · '+esc(p.recall_pct)+'% accurate · built a '+esc(p.index)+' index'; }

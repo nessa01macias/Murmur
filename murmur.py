@@ -549,6 +549,7 @@ async def detect_and_amplify(session, since_db):
         f"INSERT INTO events (account_id, type, topic) VALUES ('{sql_str(leader_acct)}', 'amplify', '{SIGNALS}')")
     await store_post(session, leader_acct, theme, text, avg_perf, None, "now (amplified)")
     amp_sig = {"type": "amplify", "account_id": leader_acct, "theme": theme, "budget_usd": budget,
+               "score": avg_perf, "backers": len(members), "per_point": 5,
                "text": text, "reason": reason, "ts": now_iso()}
     await produce(session, SIGNALS, [{"key": {"account_id": leader_acct}, "value": amp_sig}])
     await store_signal(session, "amplify", amp_sig)
