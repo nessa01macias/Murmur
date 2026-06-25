@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Murmur — live swarm</title>
+<style>
+  :root {
+    --bg:#0b0d12; --panel:#141821; --panel2:#1b212d; --line:#222a38;
+    --ink:#e7ecf3; --dim:#8b97a8; --dimmer:#5b6675;
+    --cyan:#35d0d6; --magenta:#d36bd0; --green:#56d364; --amber:#e3b341; --red:#f06a6a;
+    --flash:#2a3550;
+  }
+  * { box-sizing:border-box; }
+  body {
+    margin:0; background:var(--bg); color:var(--ink);
+    font:14px/1.5 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+  }
+  .mono { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+  header {
+    display:flex; align-items:center; gap:16px; flex-wrap:wrap;
+    padding:14px 22px; border-bottom:1px solid var(--line); background:#0e1218;
+    position:sticky; top:0; z-index:5;
+  }
+  header h1 { font-size:18px; margin:0; letter-spacing:.3px; }
+  header h1 b { color:var(--cyan); }
+  .status { display:flex; align-items:center; gap:8px; color:var(--dim); font-size:13px; }
+  .dot { width:9px; height:9px; border-radius:50%; background:var(--dimmer); }
+  .dot.live { background:var(--green); box-shadow:0 0 9px var(--green); animation:pulse 2s infinite; }
+  .dot.mock { background:var(--amber); box-shadow:0 0 9px var(--amber); }
+  .dot.err  { background:var(--red); box-shadow:0 0 9px var(--red); }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.35} }
+  .pill {
+    font-size:11px; padding:2px 8px; border-radius:999px; border:1px solid var(--line);
+    color:var(--dim); background:var(--panel); white-space:nowrap;
+  }
+  .pill.live { color:var(--green); border-color:#1f3a25; }
+  .pill.mock { color:var(--amber); border-color:#3a3320; }
+  .pill.derived { color:var(--cyan); border-color:#193a3b; }
+  .spacer { flex:1; }
+
+  main { padding:20px 22px; display:grid; gap:20px; grid-template-columns:1fr; max-width:1500px; margin:0 auto; }
+  @media (min-width:1050px){ main { grid-template-columns:1.55fr 1fr; } }
+  section h2 {
+    font-size:12px; text-transform:uppercase; letter-spacing:1.4px; color:var(--dim);
+    margin:0 0 12px; display:flex; align-items:center; gap:10px;
+  }
+  .col { display:flex; flex-direction:column; gap:20px; }
+
+  /* tile wall */
+  .tiles { display:grid; gap:12px; grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); }
+  .tile {
+    background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px;
+    transition:background .6s ease, border-color .6s ease, transform .15s ease;
+    position:relative; overflow:hidden;
+  }
+  .tile.flash { background:var(--flash); border-color:var(--cyan); }
+  .tile .name { font-weight:700; font-size:15px; }
+  .tile .genre { font-size:11px; color:var(--magenta); text-transform:uppercase; letter-spacing:.8px; }
+  .tile .persona { color:var(--dimmer); font-size:11.5px; margin-top:6px; min-height:30px; }
+  .tile .last { margin-top:10px; font-size:12px; color:var(--dim); border-top:1px dashed var(--line); padding-top:8px; }
+  .tile .last .subj { color:var(--ink); }
+  .tile .tdot {
+    position:absolute; top:13px; right:13px; width:8px; height:8px; border-radius:50%;
+    background:var(--dimmer);
+  }
+  .tile.active .tdot { background:var(--green); box-shadow:0 0 8px var(--green); }
+  .badge { display:inline-block; font-size:10px; padding:1px 6px; border-radius:6px; margin-right:5px; }
+  .badge.stagger  { color:var(--cyan); background:#0f2c2e; }
+  .badge.diversify{ color:var(--magenta); background:#2c0f2b; }
+
+  /* feed */
+  .feed { background:var(--panel); border:1px solid var(--line); border-radius:12px; overflow:hidden; }
+  .feed .row {
+    display:grid; grid-template-columns:60px 1fr auto 70px; gap:10px; align-items:baseline;
+    padding:9px 14px; border-bottom:1px solid var(--line); font-size:13px;
+  }
+  .feed .row.new { animation:slidein 1.2s ease; }
+  @keyframes slidein { from{ background:var(--flash); } to{ background:transparent; } }
+  .feed .row:last-child { border-bottom:none; }
+  .feed .acct { color:var(--cyan); font-weight:600; }
+  .feed .acct.b { color:var(--magenta); }
+  .feed .subj { color:var(--ink); }
+  .feed .meta { color:var(--dimmer); font-size:11px; }
+  .feed .perf { color:var(--amber); text-align:right; white-space:nowrap; }
+  .feed .when { color:var(--dim); text-align:right; white-space:nowrap; font-size:11px; }
+  .feedhint { color:var(--dimmer); font-size:11px; margin-top:8px; }
+
+  /* operator strip */
+  .ops { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px; }
+  .ops .top { font-size:13px; color:var(--dim); margin-bottom:12px; }
+  .ops .top b { color:var(--amber); }
+  .bar { margin-bottom:10px; }
+  .bar .lab { display:flex; justify-content:space-between; font-size:12px; margin-bottom:4px; }
+  .bar .lab .t { color:var(--ink); }
+  .bar .lab .t.spike { color:var(--amber); font-weight:700; }
+  .bar .lab .v { color:var(--dim); }
+  .track { height:9px; background:var(--panel2); border-radius:6px; overflow:hidden; }
+  .fill { height:100%; background:var(--cyan); border-radius:6px; transition:width .8s ease; }
+  .fill.spike { background:linear-gradient(90deg,var(--amber),var(--magenta)); }
+
+  .legend { color:var(--dimmer); font-size:11px; margin-top:6px; }
+  .err { color:var(--red); font-size:12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1><b>Murmur</b> · live swarm</h1>
+  <div class="status">
+    <span id="dot" class="dot"></span>
+    <span id="statustext">connecting…</span>
+  </div>
+  <span class="spacer"></span>
+  <span class="pill" id="p-accounts">accounts —</span>
+  <span class="pill" id="p-posts">posts —</span>
+  <span class="pill" id="p-ops">budget —</span>
+  <span class="pill mono" id="p-updated">—</span>
+</header>
+
+<main>
+  <div class="col">
+    <section>
+      <h2>The swarm <span class="pill mono" id="tilecount">0 accounts</span></h2>
+      <div class="tiles" id="tiles"></div>
+    </section>
+    <section>
+      <h2>Live feed <span class="pill mono">SELECT * FROM posts ORDER BY created_at DESC</span></h2>
+      <div class="feed" id="feed"></div>
+      <div class="feedhint">Each row is one real DB row. Run the proof query in the agent chat — these tiles must match it.</div>
+    </section>
+  </div>
+
+  <div class="col">
+    <section>
+      <h2>Operator · amplify</h2>
+      <div class="ops" id="ops"></div>
+      <div class="legend">Resonating theme detected from post performance → ad budget shifts toward it.</div>
+    </section>
+    <section>
+      <h2>Coordination</h2>
+      <div class="ops">
+        <div class="bar"><span class="badge stagger">stagger</span><span class="meta" id="staggertext">—</span></div>
+        <div class="bar"><span class="badge diversify">diversify</span><span class="meta" id="diversifytext">—</span></div>
+        <div class="legend">No controller, no human — agents read the shared stream, then stagger timing &amp; diversify topic.</div>
+      </div>
+    </section>
+  </div>
+</main>
+
+<script>
+const POLL_MS = 2000;
+let lastByAccount = {};   // account_id -> latest post id (to flash tiles on change)
+let seenPostIds = new Set();   // post ids already shown (to animate only NEW feed rows)
+let firstPaint = true;
+
+function fmtClock(iso){
+  if(!iso) return "—";
+  const d = new Date(iso);
+  return d.toLocaleTimeString([], {hour:"2-digit", minute:"2-digit", second:"2-digit"});
+}
+function ago(iso){
+  if(!iso) return "";
+  const s = Math.max(0, Math.floor((Date.now() - new Date(iso).getTime())/1000));
+  if(s < 60) return s + "s ago";
+  if(s < 3600) return Math.floor(s/60) + "m ago";
+  return Math.floor(s/3600) + "h ago";
+}
+function shortName(persona){
+  if(!persona) return "?";
+  return persona.split("—")[0].trim().split(" ")[0];
+}
+function setPill(id, label, src){
+  const el = document.getElementById(id);
+  el.textContent = label + " · " + src;
+  el.className = "pill " + (src.startsWith("live") ? "live" : src.startsWith("derived") ? "derived" : "mock");
+}
+
+function render(s){
+  // ---- status ----
+  const dot = document.getElementById("dot");
+  const st = document.getElementById("statustext");
+  if(s.error){
+    dot.className = "dot err";
+    st.innerHTML = 'DB error — showing mock. <span class="err mono">' + s.error + '</span>';
+  } else if(s.mode === "live"){
+    dot.className = "dot live";
+    st.textContent = "live · polling pg-conductor every " + (POLL_MS/1000) + "s";
+  } else {
+    dot.className = "dot mock";
+    st.textContent = "mock preview · set DATABASE_URL to go live";
+  }
+  document.getElementById("p-updated").textContent = fmtClock(s.generated_at);
+  setPill("p-accounts", "accounts", s.sources.accounts);
+  setPill("p-posts", "posts", s.sources.posts);
+  setPill("p-ops", "budget", s.sources.ops);
+
+  // ---- index latest post per account ----
+  const latest = {};
+  for(const p of s.posts){
+    if(!(p.account_id in latest)) latest[p.account_id] = p;  // posts are newest-first
+  }
+
+  // ---- tiles ----
+  const tiles = document.getElementById("tiles");
+  tiles.innerHTML = "";
+  const order = Object.keys(latest);
+  s.accounts.forEach((a, i) => {
+    const lp = latest[a.id];
+    const changed = lp && lastByAccount[a.id] !== undefined && lastByAccount[a.id] !== lp.id;
+    const div = document.createElement("div");
+    div.className = "tile" + (lp ? " active" : "") + ((changed && !firstPaint) ? " flash" : "");
+    let lastHtml = '<div class="last">quiet — no posts yet</div>';
+    if(lp){
+      lastHtml = '<div class="last">last: <span class="subj">' +
+        (lp.subject ? esc(lp.subject) : "—") + '</span> · <span class="mono">' + ago(lp.created_at) + '</span></div>';
+    }
+    div.innerHTML =
+      '<span class="tdot"></span>' +
+      '<div class="name">' + esc(shortName(a.persona) || a.id) + '</div>' +
+      '<div class="genre">' + esc(a.genre || "") + '</div>' +
+      '<div class="persona">' + esc(a.persona || a.id) + '</div>' +
+      lastHtml;
+    tiles.appendChild(div);
+    if(changed && !firstPaint){ setTimeout(() => div.classList.remove("flash"), 900); }
+  });
+  document.getElementById("tilecount").textContent = s.accounts.length + " accounts";
+  // remember latest ids for next diff
+  const nl = {};
+  for(const a of s.accounts){ if(latest[a.id]) nl[a.id] = latest[a.id].id; }
+  lastByAccount = nl;
+
+  // ---- feed ----
+  const feed = document.getElementById("feed");
+  feed.innerHTML = "";
+  const accIndex = {}; s.accounts.forEach((a,i)=>accIndex[a.id]=i);
+  const nowSeen = new Set();
+  s.posts.forEach(p => {
+    const idStr = String(p.id);
+    nowSeen.add(idStr);
+    const isNew = !firstPaint && !seenPostIds.has(idStr);
+    const row = document.createElement("div");
+    row.className = "row" + (isNew ? " new" : "");
+    const isB = (accIndex[p.account_id] || 0) % 2 === 1;
+    const perf = (p.performance!=null) ? Math.round(p.performance).toLocaleString() : "—";
+    row.innerHTML =
+      '<span class="acct' + (isB?" b":"") + ' mono">' + esc(p.account_id||"?") + '</span>' +
+      '<span><span class="subj">' + (p.subject?esc(p.subject):'<span class="meta">(post)</span>') + '</span>' +
+        (p.diversified_from ? ' <span class="meta">↯ vs ' + esc(p.diversified_from) + '</span>' : '') + '</span>' +
+      '<span class="perf">' + perf + '</span>' +
+      '<span class="when mono" title="' + esc(p.created_at||"") + '">' + fmtClock(p.created_at) + '</span>';
+    feed.appendChild(row);
+  });
+  seenPostIds = nowSeen;
+  if(s.posts.length === 0){
+    feed.innerHTML = '<div class="row"><span class="meta">no posts yet — waiting for the swarm…</span></div>';
+  }
+
+  // ---- operator strip ----
+  const ops = document.getElementById("ops");
+  const o = s.ops || {themes:[]};
+  let html = '<div class="top">resonating theme: <b>' + (o.top?esc(o.top):"—") +
+             '</b> · budget pool ' + (o.budget_total||0).toLocaleString() + '</div>';
+  const max = Math.max(1, ...o.themes.map(t=>t.budget||0));
+  for(const t of o.themes){
+    const w = Math.round(100*(t.budget||0)/max);
+    html += '<div class="bar"><div class="lab"><span class="t' + (t.spike?" spike":"") + '">' +
+      esc(t.theme) + (t.spike?" ◀ amplifying":"") + '</span><span class="v">' +
+      Math.round(t.budget||0).toLocaleString() + '</span></div>' +
+      '<div class="track"><div class="fill' + (t.spike?" spike":"") + '" style="width:' + w + '%"></div></div></div>';
+  }
+  ops.innerHTML = html;
+
+  // ---- coordination summary ----
+  const posts = s.posts.slice().sort((a,b)=> new Date(a.created_at)-new Date(b.created_at));
+  let staggerTxt = "—", diversifyTxt = "—";
+  if(posts.length >= 2){
+    const a1 = posts[posts.length-2], a2 = posts[posts.length-1];
+    const gap = Math.abs((new Date(a2.created_at)-new Date(a1.created_at))/1000);
+    staggerTxt = "last two posts " + Math.round(gap) + "s apart (" + esc(a1.account_id) + " → " + esc(a2.account_id) + ")";
+    diversifyTxt = a1.subject && a2.subject
+      ? (a1.subject.toLowerCase()===a2.subject.toLowerCase()
+          ? "repeat detected: “" + esc(a2.subject) + "”"
+          : "“" + esc(a1.subject) + "” → “" + esc(a2.subject) + "” (different hooks)")
+      : "subjects not in schema yet";
+  }
+  document.getElementById("staggertext").innerHTML = staggerTxt;
+  document.getElementById("diversifytext").innerHTML = diversifyTxt;
+
+  firstPaint = false;
+}
+
+function esc(s){ return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+async function tick(){
+  try {
+    const r = await fetch("/api/state", {cache:"no-store"});
+    render(await r.json());
+  } catch(e){
+    const dot = document.getElementById("dot");
+    dot.className = "dot err";
+    document.getElementById("statustext").textContent = "dashboard offline — " + e;
+  }
+}
+tick();
+setInterval(tick, POLL_MS);
+</script>
+</body>
+</html>

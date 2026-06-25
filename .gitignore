@@ -1,0 +1,17 @@
+# secrets — NEVER commit
+.env
+*/.env
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+
+# node
+node_modules/
+
+# local clone of upstream Aiven-Open/mcp-aiven — re-cloned locally, not tracked here
+mcp-aiven/
+
+# os
+.DS_Store
