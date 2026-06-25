@@ -13,7 +13,10 @@ COPY dashboard/ dashboard/
 
 # HF Spaces serves the port declared as app_port (7860). The dashboard binds it publicly;
 # the conductor keeps its own status endpoint on 8080 (internal).
-ENV HOST=0.0.0.0 FLASK_DEBUG=0 MURMUR_FLEET=6 MURMUR_INTERVAL=180 \
+# MURMUR_NO_MOCK=1 → the dashboard never shows theatrical mock data; an empty `posts`
+# table renders as a true "standby / awaiting first round" wall (correct for a live demo
+# and honest for judges). MURMUR_INTERVAL is the conductor's decision cadence in seconds.
+ENV HOST=0.0.0.0 FLASK_DEBUG=0 MURMUR_FLEET=6 MURMUR_INTERVAL=180 MURMUR_NO_MOCK=1 \
     HOME=/tmp PYTHONUNBUFFERED=1
 EXPOSE 7860
 

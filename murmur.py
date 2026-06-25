@@ -26,8 +26,10 @@ script (auto-loaded) or export them:
 then:
     uv run --with mcp --with anthropic --with fastembed python murmur.py
     MURMUR_FLEET=10 uv run --with mcp --with anthropic --with fastembed python murmur.py  # scale up
-    uv run --with mcp --with anthropic --with fastembed python murmur.py --onboard "cozy-mystery"
-    #   ^ a new agent provisions its OWN Kafka lane + Postgres state via the MCP, then joins the round
+    uv run --with mcp --with anthropic --with fastembed --with claude-agent-sdk python murmur.py --onboard "cozy-mystery"
+    #   ^ onboarding is SDK-driven: a REAL Claude Agent SDK agent decides to call the Aiven MCP
+    #     provisioning tools ITSELF (own Kafka lane + Postgres state + announce), then hands off to
+    #     the deterministic diversify-join. Needs the Claude Code CLI: npm i -g @anthropic-ai/claude-code
     uv run --with mcp --with anthropic --with fastembed python murmur.py --tier2
     #   ^ the watcher agent observes its own DB load, then provisions a pgvector index to self-optimize
     # first run downloads a small (~130MB) local embedding model, one time
@@ -127,11 +129,13 @@ def now_iso():
 
 # ----------------------------------------------------------------------------- json helpers
 def extract_json(text):
-    """Pull a JSON value out of an MCP/LLM text payload, tolerant of wrappers,
-    prose, or markdown code fences around it."""
+    """Pull a JSON value out of an MCP/LLM text payload, tolerant of wrappers, prose, or
+    markdown fences. Robust to the MCP 'untrusted data' envelope even when the payload was
+    TRUNCATED at the output cap (closing tag missing), and never scans O(n^2) on big blobs."""
     if text is None:
         raise ValueError("empty tool/LLM result")
-    m = re.search(r"<untrusted-[^>]*>(.*)</untrusted-[^>]*>", text, re.DOTALL)
+    # unwrap the MCP untrusted-data envelope; the closing tag may be absent if truncated
+    m = re.search(r"<untrusted-[^>]*>(.*?)(?:</untrusted-[^>]*>|\Z)", text, re.DOTALL)
     if m:
         text = m.group(1)
     text = text.strip()
@@ -141,16 +145,15 @@ def extract_json(text):
         return json.loads(text)
     except json.JSONDecodeError:
         pass
+    # decode the first JSON value in O(n) via raw_decode (no quadratic backward scan)
     starts = [i for i in (text.find("{"), text.find("[")) if i != -1]
     if not starts:
         raise ValueError(f"no JSON found in: {text[:200]!r}")
-    start = min(starts)
-    for end in range(len(text), start, -1):
-        try:
-            return json.loads(text[start:end])
-        except json.JSONDecodeError:
-            continue
-    raise ValueError(f"could not parse JSON from: {text[:200]!r}")
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(text, min(starts))
+        return obj
+    except json.JSONDecodeError:
+        raise ValueError(f"could not parse JSON from: {text[:200]!r}")
 
 # ----------------------------------------------------------------------------- embeddings (local)
 _EMBEDDER = None
@@ -183,7 +186,9 @@ async def call(session, tool, args, retries=4):
         low = text.lower()
         transient = any(s in low for s in (
             "429", "rate limit", "too many requests", "temporarily",
-            "service unavailable", "503", "timed out", "timeout"))
+            "service unavailable", "503", "timed out", "timeout",
+            # transient DNS / connection blips between the MCP server and Postgres/Kafka
+            "eai_again", "getaddrinfo", "connection error", "econnreset", "etimedout"))
         if transient and attempt < retries - 1:
             await asyncio.sleep(delay)
             delay *= 2
@@ -210,7 +215,8 @@ async def produce(session, topic, records):
 async def consume(session, topic=POSTS, offset=0):
     txt = await call(session, "aiven_kafka_topic_message_list", {
         "project": PROJECT, "service_name": KAFKA_SVC, "topic_name": topic,
-        "partitions": {"0": {"offset": offset}}, "format": FORMAT, "timeout": 10000})
+        "partitions": {"0": {"offset": offset}}, "format": FORMAT,
+        "timeout": 8000, "max_bytes": 60000})   # bound the payload under the MCP output cap
     parsed = extract_json(txt)
     if isinstance(parsed, list):
         return parsed
@@ -219,6 +225,16 @@ async def consume(session, topic=POSTS, offset=0):
             if isinstance(parsed.get(k), list):
                 return parsed[k]
     return []
+
+async def latest_offset(session, topic=POSTS):
+    """High-water offset of the topic, regex-scanned straight from the metadata text (robust to
+    the untrusted-data wrapper + any truncation), so agents read only the RECENT tail. Reading
+    from offset 0 returns the whole backlog, which blows past the MCP output cap (100k chars)
+    and comes back truncated — and gets slower every round as the topic grows."""
+    txt = await call(session, "aiven_kafka_topic_get", {
+        "project": PROJECT, "service_name": KAFKA_SVC, "topic_name": topic})
+    offs = [int(x) for x in re.findall(r'"latest_offset"\s*:\s*(\d+)', txt)]
+    return max(offs) if offs else 0
 
 def msg_value(rec):
     """Normalize a consumed record's `value` to a dict."""
@@ -262,6 +278,18 @@ async def store_signal(session, kind, payload):
     await pg_write(session,
         f"INSERT INTO signals (kind, payload) VALUES "
         f"('{sql_str(kind)}', '{sql_str(json.dumps(payload))}'::jsonb)")
+
+async def set_activity(session, account_id, state, detail=""):
+    """Live work-trail: record what an agent is doing RIGHT NOW (reading → thinking →
+    rephrasing → posting → amplifying → provisioning) so the dashboard can show the swarm
+    *working*, not just its finished rows. Append-only; the wall reads the latest per agent.
+    Best-effort — a status write must NEVER break a round, so failures are swallowed."""
+    try:
+        await pg_write(session,
+            f"INSERT INTO activity (account_id, state, detail) VALUES "
+            f"('{sql_str(account_id)}', '{sql_str(state)}', '{sql_str(detail)}')")
+    except Exception:  # noqa: BLE001 — cosmetic liveness only
+        pass
 
 # --- Tier 2 observe/optimize MCP wrappers ---
 async def query_stats(session, order_by="total_time:desc", limit=5, search=None):
@@ -353,6 +381,9 @@ async def ensure_schema(session):
     await pg_write(session,
         "CREATE TABLE IF NOT EXISTS signals (id bigserial PRIMARY KEY, kind text NOT NULL, "
         "payload jsonb NOT NULL, ts timestamptz NOT NULL DEFAULT now())")
+    await pg_write(session,
+        "CREATE TABLE IF NOT EXISTS activity (id bigserial PRIMARY KEY, account_id text NOT NULL, "
+        "state text NOT NULL, detail text, ts timestamptz NOT NULL DEFAULT now())")
     for topic in (POSTS, SIGNALS):
         try:  # topics are usually pre-created; tolerate "already exists"
             await call(session, "aiven_kafka_topic_create", {
@@ -384,15 +415,22 @@ async def agent_post(session, acct_id, color, since_iso, since_db):
     staggered time, and publish. `since_*` scope coordination to the current round."""
     me = await load_account(session, acct_id)
     banner(color, f"▶ {acct_id}", f"{me['persona'].split(' — ')[0]} · {me['genre']}")
+    await set_activity(session, me["id"], "reading", "scanning the stream for what peers just planned")
 
-    # read the Kafka stream (the coordination bus) to see what the fleet just planned
+    # read only the RECENT tail of the Kafka stream (the coordination bus) — reading from
+    # offset 0 returns the whole backlog, which exceeds the MCP output cap and truncates
+    try:
+        hw = await latest_offset(session, POSTS)
+    except Exception:
+        hw = 0
+    start_off = max(0, hw - 40)     # ~a round's worth of recent posts, well under the cap
     peers = []
-    for _ in range(8):
+    for _ in range(5):
         try:
-            recs = await consume(session, POSTS, 0)
+            recs = await consume(session, POSTS, start_off)
         except Exception as e:
             step(f"{DIM}stream not ready ({str(e)[:40]}…), retrying{RESET}")
-            await asyncio.sleep(2)
+            await asyncio.sleep(1.5)
             continue
         latest = {}
         for rec in recs:
@@ -417,6 +455,7 @@ async def agent_post(session, acct_id, color, since_iso, since_db):
     vec, sim, near_acct, near_sub, avoid = None, 0.0, None, None, ""
     for attempt in range(1, DIVERSIFY_TRIES + 1):
         print(f"   {DIM}thinking with {MODEL} (try {attempt})…{RESET}")
+        await set_activity(session, me["id"], "thinking", f"drafting a hook unlike the others (try {attempt})")
         d = await asyncio.to_thread(decide, persona_system(me), base + avoid + tail)
         subject, text = d.get("subject", "").strip(), d.get("text", "").strip()
         when, reason = d.get("scheduled_for", "").strip(), d.get("reason", "").strip()
@@ -431,11 +470,14 @@ async def agent_post(session, acct_id, color, since_iso, since_db):
             break
         print(f"   {YELLOW}✗ pgvector: {subject!r} is {sim:.2f} similar to {near_sub!r} "
               f"(> {SIM_REJECT}) — too close, rethinking…{RESET}")
+        await set_activity(session, me["id"], "rephrasing",
+                           f"“{subject}” was {sim:.2f}≈ “{near_sub}” — too close, rethinking")
         avoid = (f"Your previous idea \"{subject}\" was too similar (cosine {sim:.2f}) to the "
                  f"existing hook \"{near_sub}\". Choose a materially different angle. ")
     else:
         print(f"   {YELLOW}kept last candidate after {DIVERSIFY_TRIES} tries (sim {sim:.2f}){RESET}")
 
+    await set_activity(session, me["id"], "posting", f"“{subject}” · {sim:.2f} distinct")
     performance = random.randint(40, 100)   # simulated engagement (posting itself is simulated)
     print(f"   {BOLD}POST{RESET}: {color}{subject}{RESET} {DIM}@ {when}{RESET}  ·  "
           f"sim {sim:.2f}  ·  perf {performance}/100")
@@ -488,6 +530,7 @@ async def detect_and_amplify(session, since_db):
     # amplify: the theme owner allocates ad budget and doubles down (legit marketing ops)
     me = await load_account(session, leader_acct)
     budget = avg_perf * 5    # simulated ad spend, scales with how strongly the theme resonates
+    await set_activity(session, leader_acct, "amplifying", f"${budget} behind “{theme}”")
     d = await asyncio.to_thread(
         decide, persona_system(me),
         f"A theme you own is resonating across the fleet: \"{theme}\" (avg performance "
@@ -538,80 +581,223 @@ async def do_demo(session):
     banner(GREEN, "✓ done", "no controller, no human, no backend — the fleet coordinated itself via Aiven.")
     return {"agents": FLEET_SIZE, "at": since_iso, **(summary or {})}
 
-# ----------------------------------------------------------------------------- onboard (self-provision)
-async def onboard(session, segment):
-    """A brand-new agent provisions its OWN place in the swarm via the MCP — its own Kafka lane
-    (topic) and its own Postgres state — then joins the live round on the shared bus. Every call
-    is a fast op (topic create + DDL = seconds), safe to fire live."""
-    await ensure_schema(session)
+# ----------------------------------------------------------------------------- onboard (Claude Agent SDK)
+# THE onboarding path: a REAL autonomous agent (claude-agent-sdk) decides to call the Aiven
+# MCP provisioning tools ITSELF — instead of our Python parsing an LLM JSON decision and
+# calling them for it. Used by the --onboard flag AND embedded in the autonomous conductor.
+# Hybrid by design:
+#   [1] run_sdk_provision() — the SDK agent autonomously creates its own Kafka lane
+#       (posts.<seg>), inserts its own accounts row, and announces on the lane. We watch
+#       every tool it picks and print it (that IS the autonomy demo).
+#   [2] sdk_join()          — then we REUSE the deterministic, measured diversify-join via
+#       the existing agent_post(), because the pgvector cosine<0.80 threshold loop must stay
+#       hand-rolled + exact. onboard_sdk() wraps both for the CLI; conductor_cycle() calls
+#       run_sdk_provision()+sdk_join() directly on its own session.
+# claude-agent-sdk is an OPTIONAL dep, imported lazily so the rest of murmur runs without
+# it; it shells out to the `claude` CLI (Node), so a missing CLI is reported with a hint.
+def _seg_identity(segment):
+    """Normalize a segment to (seg, acct_id, lane). We FIX the agent's identity
+    (acct_<seg>, posts.<seg>) rather than let it invent one — so the deterministic join in
+    step [2] knows exactly which account/lane to use, the dashboard/roster stay coherent,
+    and re-runs are idempotent (ON CONFLICT)."""
     seg = re.sub(r"[^a-z0-9]+", "-", segment.strip().lower()).strip("-") or "segment"
     acct_id = f"acct_{seg.replace('-', '_')}"
-    lane = f"{POSTS}.{seg}"     # its own dedicated announce lane (NOT where it coordinates)
+    lane = f"{POSTS}.{seg}"
+    return seg, acct_id, lane
 
-    banner(GREEN, "✦ onboard", f"a new '{segment}' agent is provisioning itself into the swarm")
 
-    # 1) the agent REASONS that it needs its own lane + state (an actual LLM decision)
-    print(f"   {DIM}thinking with {MODEL}…{RESET}")
-    d = await asyncio.to_thread(
-        decide,
-        f"You are a brand-new autonomous account-agent joining an existing '{GENRE}' book-marketing "
-        f"fleet to cover the '{segment}' audience segment. Before you can work you must provision your "
-        f"own place in the swarm. Answer with a single JSON object only.",
-        f"Decide your identity and why you need your own infrastructure. Reply ONLY JSON: "
-        f'{{"persona": "<a name + one-line persona for the {segment} segment>", '
-        f'"reason": "<one sentence: why you need your own coordination lane and your own state>", '
-        f'"announce": "<a one-line birth announcement to publish on your new lane>"}}')
-    persona = d.get("persona", f"{segment} specialist").strip()
-    reason = d.get("reason", "").strip()
-    announce = d.get("announce", f"The {segment} desk is live.").strip()
-    print(f"   decision: {BOLD}PROVISION & JOIN{RESET}")
-    print(f"   identity: {GREEN}{acct_id}{RESET} — {persona}")
-    print(f"   why:      {DIM}{reason}{RESET}")
+async def run_sdk_provision(segment, token):
+    """Let a REAL claude-agent-sdk agent provision this segment's place in the swarm by
+    autonomously calling the Aiven MCP tools itself. Returns
+    {acct_id, lane, persona, tools_called:[...], result_text, mcp_connected}.
 
-    timings = {}
-    # 2) provision its OWN Kafka lane (real infra creation, via MCP) — seconds, safe live
-    t = time.perf_counter()
+    We pin the agent's identity (acct_<seg> / posts.<seg>) and hand it the exact table
+    shape + tool names so it stays on-script; max_turns + a tight allowed_tools allowlist
+    + bypassPermissions keep it bounded and headless. onboard_sdk() verifies the result."""
+    # guarded, lazy import: keep the rest of murmur.py runnable without the SDK
     try:
-        await call(session, "aiven_kafka_topic_create", {
-            "project": PROJECT, "service_name": KAFKA_SVC,
-            "topic_name": lane, "partitions": 1, "replication": 1})
-        timings["aiven_kafka_topic_create"] = round((time.perf_counter() - t) * 1000)
-        step(f"provisioned its own Kafka lane {BOLD}{lane}{RESET} "
-             f"{DIM}({timings['aiven_kafka_topic_create']} ms){RESET}")
-    except Exception as e:
-        timings["aiven_kafka_topic_create"] = round((time.perf_counter() - t) * 1000)
-        step(f"{YELLOW}lane {lane} already existed ({str(e)[:40]}…){RESET}")
+        from claude_agent_sdk import (
+            query, ClaudeAgentOptions,
+            SystemMessage, AssistantMessage, ResultMessage,
+            ToolUseBlock, TextBlock, CLINotFoundError,
+        )
+    except ImportError:
+        raise SystemExit(
+            f"{YELLOW}--onboard-sdk needs the Claude Agent SDK.{RESET}\n"
+            "  pip install claude-agent-sdk   (or add --with claude-agent-sdk to uv run)\n"
+            "  It also needs Node + the Claude Code CLI:\n"
+            "    npm install -g @anthropic-ai/claude-code\n"
+            "  (ANTHROPIC_API_KEY is already required by murmur; the SDK reads it.)")
 
-    # 3) provision its OWN state (accounts row, via MCP pg_write) — seconds, safe live
-    t = time.perf_counter()
-    await pg_write(session,
-        f"INSERT INTO accounts (id, persona, genre) VALUES "
-        f"('{sql_str(acct_id)}', '{sql_str(persona)}', '{GENRE}') "
-        f"ON CONFLICT (id) DO UPDATE SET persona = EXCLUDED.persona, genre = EXCLUDED.genre")
-    timings["aiven_pg_write"] = round((time.perf_counter() - t) * 1000)
-    step(f"provisioned its own state: accounts row {BOLD}{acct_id}{RESET} "
-         f"{DIM}({timings['aiven_pg_write']} ms){RESET}")
+    seg, acct_id, lane = _seg_identity(segment)
 
-    # 4) USE its new lane: publish a birth announcement (via MCP produce)
-    t = time.perf_counter()
-    await produce(session, lane, [{"key": {"account_id": acct_id}, "value": {
-        "account_id": acct_id, "type": "announce", "segment": segment,
-        "text": announce, "ts": now_iso()}}])
-    timings["aiven_kafka_topic_message_produce"] = round((time.perf_counter() - t) * 1000)
-    step(f"announced on its lane {DIM}({timings['aiven_kafka_topic_message_produce']} ms){RESET}: "
-         f"\"{announce}\"")
+    banner(GREEN, "✦ onboard-sdk",
+           f"a REAL agent (claude-agent-sdk) provisions the '{segment}' segment by "
+           f"calling the Aiven MCP itself")
+    step(f"identity we assign it: {GREEN}{acct_id}{RESET} · lane {BOLD}{lane}{RESET} "
+         f"{DIM}(fixed by us so the deterministic join can find it){RESET}")
 
-    # 5) JOIN the live round on the SHARED bus — diversify vs the recent fleet + show on the wall
-    banner(GREEN, "↳ join", f"{acct_id} joins the shared '{POSTS}' round and diversifies vs the fleet")
-    # diversify against the day's fleet activity (wide window so onboarding works whenever)
+    # Remote Aiven MCP over HTTP with the bearer token (same endpoint as connect_and_run).
+    # Its tools are exposed to the agent as mcp__aiven__<tool>.
+    options = ClaudeAgentOptions(
+        model=MODEL,
+        mcp_servers={
+            "aiven": {
+                "type": "http",
+                "url": MCP_URL,
+                "headers": {"Authorization": f"Bearer {token}"},
+            }
+        },
+        # tight allowlist: ONLY the provisioning tools (+ pg_read so it can self-verify).
+        allowed_tools=[
+            "mcp__aiven__aiven_kafka_topic_create",
+            "mcp__aiven__aiven_pg_write",
+            "mcp__aiven__aiven_kafka_topic_message_produce",
+            "mcp__aiven__aiven_pg_read",
+        ],
+        # headless auto-approve. SDK 0.1.x has NO "dontAsk" mode; valid literals are
+        # default/acceptEdits/plan/bypassPermissions. IMPORTANT: under bypassPermissions the
+        # allow list only PRE-APPROVES — the whole mcp__aiven__* catalog is still reachable —
+        # so the real guard is the DENY list below (deny wins even under bypass). We block the
+        # built-in fs/shell tools AND every destructive/costly Aiven tool, so even if the agent
+        # went off-script the worst it can reach are the harmless provisioning + read tools.
+        permission_mode="bypassPermissions",
+        disallowed_tools=[
+            "Bash", "Read", "Write", "Edit", "WebFetch", "WebSearch",
+            "mcp__aiven__aiven_kafka_topic_delete", "mcp__aiven__aiven_kafka_topic_update",
+            "mcp__aiven__aiven_service_create", "mcp__aiven__aiven_service_update",
+            "mcp__aiven__aiven_service_integration_create",
+            "mcp__aiven__aiven_service_integration_update",
+            "mcp__aiven__aiven_service_integration_delete",
+            "mcp__aiven__aiven_pg_bouncer_create", "mcp__aiven__aiven_pg_bouncer_update",
+            "mcp__aiven__aiven_pg_bouncer_delete",
+            "mcp__aiven__aiven_kafka_connect_delete_connector",
+            "mcp__aiven__aiven_kafka_connect_edit_connector",
+            "mcp__aiven__aiven_application_deploy", "mcp__aiven__aiven_application_redeploy",
+        ],
+        max_turns=12,          # bounds the agent's tool-call loop (3 provisions + slack)
+        setting_sources=[],    # don't load the user's ~/.claude project config
+        system_prompt=(
+            f"You are {acct_id}, a brand-new autonomous account-agent joining an existing "
+            f"'{GENRE}' book-marketing fleet to cover the '{segment}' audience segment. "
+            f"You coordinate over Aiven Kafka and remember in Aiven Postgres, and you must "
+            f"PROVISION YOUR OWN PLACE in the swarm using ONLY the Aiven MCP tools — no human "
+            f"will do it for you. Work concisely and in-character, then stop."),
+        cwd=os.path.dirname(os.path.abspath(__file__)),
+    )
+
+    # The task: give the agent its fixed identity and the EXACT tool args/table shape so a
+    # single clean pass provisions correctly (and re-runs stay idempotent).
+    prompt = (
+        f"Provision your place in the swarm, in this order, using the Aiven MCP. "
+        f"Project is \"{PROJECT}\", Kafka service \"{KAFKA_SVC}\", Postgres service \"{PG_SVC}\".\n\n"
+        f"1) Create YOUR OWN Kafka lane topic. Call aiven_kafka_topic_create with "
+        f"topic_name=\"{lane}\", partitions=1, replication=1. If it already exists, that is fine — continue.\n\n"
+        f"2) Insert YOUR OWN account row. Call aiven_pg_write with this exact query "
+        f"(invent a short in-character persona string for the '{segment}' segment, "
+        f"single-quoted, no apostrophes inside):\n"
+        f"   INSERT INTO accounts (id, persona, genre) VALUES "
+        f"('{acct_id}', '<your persona>', '{GENRE}') "
+        f"ON CONFLICT (id) DO UPDATE SET persona = EXCLUDED.persona, genre = EXCLUDED.genre\n\n"
+        f"3) Announce your birth on YOUR lane. Call aiven_kafka_topic_message_produce with "
+        f"topic_name=\"{lane}\", format=\"{FORMAT}\", and records being a one-element list "
+        f"[{{\"key\": {{\"account_id\": \"{acct_id}\"}}, \"value\": {{\"account_id\": \"{acct_id}\", "
+        f"\"type\": \"announce\", \"segment\": \"{segment}\", \"text\": \"<a one-line birth announcement>\", "
+        f"\"ts\": \"{now_iso()}\"}}}}].\n\n"
+        f"When all three succeed, reply with one short line stating your persona and that "
+        f"{acct_id} is provisioned and live. Do not call any other tools.")
+
+    tools_called, persona, result_text, mcp_ok = [], None, None, False
+
+    # async for (never break — avoids the SDK's asyncio cleanup issues)
+    try:
+        async for message in query(prompt=prompt, options=options):
+            if isinstance(message, SystemMessage):
+                if message.subtype == "init":
+                    # surface MCP connection status so a bad token/endpoint is obvious
+                    for srv in (message.data or {}).get("mcp_servers", []):
+                        ok = srv.get("status") == "connected"
+                        mcp_ok = mcp_ok or ok
+                        col = GREEN if ok else YELLOW
+                        step(f"{col}MCP server {srv.get('name')}: {srv.get('status')}{RESET}")
+            elif isinstance(message, AssistantMessage):
+                for block in message.content:
+                    if isinstance(block, ToolUseBlock):
+                        # THE AUTONOMY, made visible: the agent itself chose this tool.
+                        name = block.name.split("__")[-1]
+                        tools_called.append(name)
+                        arg_hint = (block.input.get("topic_name")
+                                    or (str(block.input.get("query", ""))[:60])
+                                    or "")
+                        print(f"   {MAGENTA}⚡ agent → {name}{RESET} {DIM}{arg_hint}{RESET}")
+                    elif isinstance(block, TextBlock) and block.text.strip():
+                        print(f"   {DIM}{block.text.strip()[:140]}{RESET}")
+            elif isinstance(message, ResultMessage):
+                result_text = message.result
+                cost = (f"${message.total_cost_usd:.4f}"
+                        if message.total_cost_usd is not None else "n/a")
+                tag = GREEN if not message.is_error else YELLOW
+                step(f"{tag}agent finished: {message.subtype} · "
+                     f"{message.num_turns} turns · {cost}{RESET}")
+    except CLINotFoundError:
+        raise SystemExit(
+            f"{YELLOW}claude-agent-sdk is installed but the Claude Code CLI is missing.{RESET}\n"
+            "  install Node 18+, then:  npm install -g @anthropic-ai/claude-code")
+
+    if persona is None:   # the agent's row is the source of truth; this is only a fallback label
+        persona = f"{segment} specialist"
+    return {"acct_id": acct_id, "lane": lane, "persona": persona,
+            "tools_called": tools_called, "result_text": result_text, "mcp_connected": mcp_ok}
+
+
+async def sdk_join(session, segment, prov):
+    """Deterministic diversify-join for an SDK-provisioned agent, on an EXISTING raw MCP session.
+    Verifies (and backfills) the accounts row the agent should have written, then runs the same
+    hand-rolled agent_post() pgvector cosine<0.80 loop as a normal round. Reused by BOTH the CLI
+    path (onboard_sdk) and the autonomous conductor (conductor_cycle), so the measured threshold
+    loop stays exact in either entry point."""
+    seg, acct_id, lane = _seg_identity(segment)
+    await ensure_schema(session)   # tolerate a fresh DB; idempotent
+
+    # VERIFY the agent actually provisioned (defend against an off-script agent):
+    rows = await pg_read(session,
+        f"SELECT id, persona, genre FROM accounts WHERE id = '{sql_str(acct_id)}'")
+    if not rows:
+        step(f"{YELLOW}agent row {acct_id} not found — backfilling so the join can proceed{RESET}")
+        await pg_write(session,
+            f"INSERT INTO accounts (id, persona, genre) VALUES "
+            f"('{sql_str(acct_id)}', '{sql_str(prov['persona'])}', '{GENRE}') "
+            f"ON CONFLICT (id) DO UPDATE SET persona = EXCLUDED.persona, genre = EXCLUDED.genre")
+    else:
+        step(f"{GREEN}verified: agent's accounts row {acct_id} is present "
+             f"(persona: {str(rows[0]['persona'])[:48]}…){RESET}")
+
+    banner(GREEN, "↳ join",
+           f"{acct_id} joins the shared '{POSTS}' round and diversifies vs the fleet "
+           f"(deterministic, raw MCP)")
+    await set_activity(session, acct_id, "joining", "diversifying vs the fleet")
+    # wide 24h window so onboarding diversifies against the day's fleet activity whenever it runs
     window = datetime.now(timezone.utc) - timedelta(hours=24)
     since_iso = window.strftime("%Y-%m-%dT%H:%M:%SZ")
     since_db = (await pg_read(session, "SELECT (now() - interval '24 hours') AS t"))[0]["t"]
     post = await agent_post(session, acct_id, GREEN, since_iso, since_db)
 
-    banner(GREEN, "✓ born",
-           f"{acct_id} provisioned its own topic + state via the MCP, then posted — no human, no backend.")
-    return {"acct_id": acct_id, "lane": lane, "provision_timings_ms": timings, "first_post": post}
+    banner(GREEN, "✓ born (sdk)",
+           f"{acct_id}: a real agent provisioned it via the MCP, then it posted — "
+           f"no human, no backend.")
+    return {"acct_id": acct_id, "lane": lane, "persona": prov["persona"],
+            "tools_called": prov["tools_called"], "first_post": post}
+
+
+async def onboard_sdk(token, segment):
+    """THE onboarding path (CLI entry, --onboard): [1] a real claude-agent-sdk agent autonomously
+    provisions its Kafka lane + accounts row + birth-announce via the MCP, then [2] the deterministic
+    diversify-join (sdk_join) on a fresh raw MCP session. The autonomous conductor reuses the same two
+    steps directly on its own session (see conductor_cycle)."""
+    # [1] autonomous provisioning by the SDK agent (its own asyncio-driven query loop)
+    prov = await run_sdk_provision(segment, token)
+    # [2] deterministic join on a RAW MCP session opened via connect_and_run
+    return await connect_and_run(token, lambda s: sdk_join(s, segment, prov))
 
 # ----------------------------------------------------------------------------- tier 2 (self-optimize)
 async def tier2_optimize(session):
@@ -723,6 +909,24 @@ async def tier2_optimize(session):
     return {"ok": True, "bench": bench, "rows": seeded, "before_ms": round(before_ms, 1),
             "after_ms": round(after_ms, 1), "speedup": speedup, "recall_pct": recall}
 
+async def reset_data(session, hard=False):
+    """Demo reset: clear the swarm's runtime data so the wall starts EMPTY, then the agents
+    refill it in real time while the judges watch. DELETE only — the MCP write tool blocks
+    TRUNCATE/DROP. Keeps the `accounts` roster by default (the constellation stays populated
+    and visibly 'ready to act'); `--hard` also clears accounts so the fleet self-onboards from
+    zero. Same DB the live dashboard reads, so the wall goes blank the instant this finishes."""
+    await ensure_schema(session)
+    banner(YELLOW, "⟲ reset", "clearing the wall for a clean live demo (all via the MCP)")
+    for tbl in ("signals", "events", "hooks", "posts"):   # posts before accounts (FK order)
+        await pg_write(session, f"DELETE FROM {tbl}")
+        step(f"cleared {tbl}")
+    if hard:
+        await pg_write(session, "DELETE FROM accounts")
+        step("cleared accounts — the fleet will self-onboard from zero")
+    banner(GREEN, "✓ reset done",
+           "wall is empty — run a round (or let the conductor) and watch it fill in real time.")
+    return {"reset": True, "hard": hard}
+
 async def connect_and_run(token, runner=None):
     """Connect to the Aiven MCP (remote first, local stdio fallback) and run `runner`
     (default do_demo) exactly once on whichever transport exposes the write tools."""
@@ -784,9 +988,10 @@ def serve_status(port):
             return
     HTTPServer(("0.0.0.0", port), Handler).serve_forever()
 
-async def conductor_cycle(session):
+async def conductor_cycle(session, token):
     """One autonomous cycle: observe the swarm's own state via the MCP, let the LLM conductor decide
-    the next move, then dispatch it. Initiative is LLM-made, not clock-driven."""
+    the next move, then dispatch it. Initiative is LLM-made, not clock-driven. `token` is threaded
+    through so the 'onboard' action can drive the Claude Agent SDK provisioning."""
     await ensure_schema(session)
     row = (await pg_read(session,
         "SELECT (SELECT count(*) FROM posts WHERE created_at > now()-interval '30 minutes') AS recent_posts, "
@@ -811,7 +1016,11 @@ async def conductor_cycle(session):
     if action == "round":
         return await do_demo(session)
     if action == "onboard":
-        return await onboard(session, d.get("segment") or "new-segment")
+        # autonomous onboarding via the Claude Agent SDK: a REAL agent provisions its own lane +
+        # state (its own SDK session), then we diversify-join on THIS already-open raw session.
+        segment = d.get("segment") or "new-segment"
+        prov = await run_sdk_provision(segment, token)
+        return await sdk_join(session, segment, prov)
     if action == "optimize":
         return await tier2_optimize(session)
     step("idle — letting the stream settle")
@@ -824,7 +1033,7 @@ async def worker(token):
     print(f"{GREEN}[conductor] autonomous loop started — a fresh decision every ~{interval}s{RESET}")
     while True:
         try:
-            STATUS["last_round"] = await connect_and_run(token, conductor_cycle)
+            STATUS["last_round"] = await connect_and_run(token, lambda s: conductor_cycle(s, token))
             STATUS["cycles"] = STATUS.get("cycles", 0) + 1
             STATUS["last_error"] = None
         except Exception as e:                       # noqa: BLE001 — keep the loop alive
@@ -870,10 +1079,16 @@ def main():
     rule()
 
     token = os.environ["AIVEN_TOKEN"]
-    if "--onboard" in sys.argv:
-        i = sys.argv.index("--onboard")
+    if "--reset" in sys.argv:
+        asyncio.run(connect_and_run(token, lambda s: reset_data(s, "--hard" in sys.argv)))
+    elif "--onboard" in sys.argv or "--onboard-sdk" in sys.argv:
+        flag = "--onboard" if "--onboard" in sys.argv else "--onboard-sdk"
+        i = sys.argv.index(flag)
         segment = sys.argv[i + 1] if i + 1 < len(sys.argv) else "new-segment"
-        asyncio.run(connect_and_run(token, lambda s: onboard(s, segment)))
+        # onboarding is SDK-driven: a real agent provisions itself, then diversify-joins.
+        # onboard_sdk runs the SDK session then opens its own raw session for the join,
+        # so (unlike the others) it is NOT wrapped in connect_and_run here.
+        asyncio.run(onboard_sdk(token, segment))
     elif "--tier2" in sys.argv:
         asyncio.run(connect_and_run(token, tier2_optimize))
     elif "--serve" in sys.argv or _truthy(os.environ.get("MURMUR_SERVE", "")):

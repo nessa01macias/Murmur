@@ -185,6 +185,11 @@ def _get_posts(cur, tables, limit):
         rows = [_norm_post(r) for r in cur.fetchall()]
         if rows:
             return rows, "live"
+        # Empty posts table. For a live demo we must NOT fall back to the theatrical mock
+        # (it would masquerade as real on the wall); MURMUR_NO_MOCK shows a true empty/standby
+        # state so a fresh `--reset` reads as "agents ready, awaiting first round".
+        if _truthy(os.environ.get("MURMUR_NO_MOCK", "")):
+            return [], "live (empty — awaiting first round)"
         ids = [a["id"] for a in _get_accounts(cur)] or ["acct_a", "acct_b"]
         return _mock_posts(ids, limit), "mock (posts table empty)"
 
@@ -327,6 +332,23 @@ def _get_signals(cur, tables, limit=14):
     return rows, ("live" if rows else "empty")
 
 
+def _get_activity(cur, tables):
+    """Each agent's CURRENT work-step (reading → thinking → rephrasing → posting → amplifying →
+    provisioning), latest row per account from the agents' live work-trail. Lets the wall show the
+    swarm *working*, not just its finished posts. Read-only; {} if the table isn't there yet."""
+    if "activity" not in tables:
+        return {}
+    try:
+        cur.execute(
+            "SELECT DISTINCT ON (account_id) account_id, state, detail, ts "
+            "FROM activity ORDER BY account_id, id DESC"
+        )
+        return {r["account_id"]: {"state": r["state"], "detail": r["detail"], "ts": _iso(r["ts"])}
+                for r in cur.fetchall()}
+    except Exception:  # noqa: BLE001 — liveness garnish; never break the poll
+        return {}
+
+
 def _get_diversity(cur, tables):
     """Live pgvector readout. For each hook (latest per account+subject) find the nearest
     peer hook from ANOTHER account within the same ~round window, and return the cosine
@@ -410,6 +432,7 @@ def get_state(limit=60):
                     p["sim"], p["near"], p["near_subject"] = d["sim"], d["near"], d["near_subject"]
             ops = _get_ops(cur, tables, posts, posts_live=posts_src == "live")
             signals, signals_src = _get_signals(cur, tables)
+            activity = _get_activity(cur, tables)
             return {
                 "generated_at": generated_at,
                 "mode": "live",
@@ -418,9 +441,11 @@ def get_state(limit=60):
                 "posts": posts,
                 "ops": ops,
                 "signals": signals,
+                "activity": activity,
                 "sources": {"accounts": accounts_src, "posts": posts_src,
                             "ops": ops["source"], "signals": signals_src,
-                            "diversity": "live (pgvector)" if div else "none"},
+                            "diversity": "live (pgvector)" if div else "none",
+                            "activity": "live" if activity else "none"},
             }
     except Exception as e:  # noqa: BLE001 — viewer must stay up; show degraded state
         accounts = _mock_accounts()
