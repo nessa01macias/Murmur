@@ -36,10 +36,11 @@ Transport: connects to the hosted Aiven MCP (https://mcp.aiven.live/mcp) using A
 as a bearer; if that endpoint lacks the write tools (read-only), it falls back to spawning
 the bundled local server (./mcp-aiven, built with `npm install && npm run build`) over stdio.
 
-Deploy (step 4): `python murmur.py --serve` runs it as a long-running worker — a status
-endpoint on $PORT (default 8080) plus a coordination round every $MURMUR_INTERVAL seconds
-(default 300). The Dockerfile builds exactly this; deploy via Aiven Apps with ANTHROPIC_API_KEY
-and AIVEN_TOKEN injected as secrets — still all via the MCP, no direct DB/Kafka drivers.
+Autonomous mode: `python murmur.py --serve` runs the CONDUCTOR loop — a status endpoint on
+$PORT (default 8080) plus, every $MURMUR_INTERVAL seconds (default 180), an LLM decision on the
+swarm's next move (round / onboard / optimize / idle) from its own live state. No human, no
+fixed schedule of actions. The Dockerfile builds exactly this; run it under launchd/cron or
+(when access is granted) Aiven Apps with ANTHROPIC_API_KEY + AIVEN_TOKEN as secrets — all via the MCP.
 """
 
 import asyncio
@@ -255,6 +256,13 @@ async def store_post(session, account_id, subject, body, performance, diversifie
         f"VALUES ('{sql_str(account_id)}', '{sql_str(subject)}', '{sql_str(body)}', "
         f"{perf}, {div}, '{sql_str(scheduled_for)}')")
 
+async def store_signal(session, kind, payload):
+    """Durable, dashboard-readable copy of a Kafka `signals` event (trend/amplify/optimize),
+    so the wall can show the real autonomous decisions — not a re-derived stand-in."""
+    await pg_write(session,
+        f"INSERT INTO signals (kind, payload) VALUES "
+        f"('{sql_str(kind)}', '{sql_str(json.dumps(payload))}'::jsonb)")
+
 # --- Tier 2 observe/optimize MCP wrappers ---
 async def query_stats(session, order_by="total_time:desc", limit=5, search=None):
     args = {"project": PROJECT, "service_name": PG_SVC, "order_by": order_by, "limit": limit}
@@ -305,6 +313,26 @@ def persona_system(me):
             f"fleet. Your genre is '{me['genre']}'. You think briefly, in character, then act. "
             f"Always answer with a single JSON object only.")
 
+def conductor_decide(state):
+    """The autonomous conductor: decide the swarm's NEXT MOVE from its live state (LLM, not a timer)."""
+    msg = AC.messages.create(
+        model=MODEL, max_tokens=220,
+        system="You are the autonomous conductor of Murmur, a self-running book-marketing agent swarm "
+               "on Aiven. You decide the swarm's next move from its live state — there is no human and "
+               "no schedule. Answer with a single JSON object only.",
+        messages=[{"role": "user", "content":
+            f"Live state: {state['agents']} agents · {state['recent_posts']} posts in the last 30min · "
+            f"{state['mins_since_post']} min since the last post · {state['hooks']} hooks in pgvector memory · "
+            f"last self-optimize {state['mins_since_optimize']} min ago · resonating theme: \"{state['top_theme']}\".\n"
+            "Decide the next move. Options: 'round' (agents post, diversify vs peers, the fleet detects a "
+            "trend & amplifies it); 'onboard' (recruit a NEW audience-segment agent — give a 2-4 word "
+            "segment); 'optimize' (self-tune the pgvector memory index — only worthwhile once memory has "
+            "grown a lot); 'idle' (wait, if it just acted). Keep the network alive and varied; don't "
+            "onboard every cycle. Reply ONLY JSON: "
+            '{"action":"round|onboard|optimize|idle","segment":"<only if onboard>","reason":"<one sentence>"}'}])
+    raw = "".join(b.text for b in msg.content if getattr(b, "type", None) == "text")
+    return extract_json(raw)
+
 # ----------------------------------------------------------------------------- setup (idempotent)
 async def ensure_schema(session):
     """Create the tables, pgvector extension, and shared topics — idempotent, all via MCP."""
@@ -322,6 +350,9 @@ async def ensure_schema(session):
         "CREATE TABLE IF NOT EXISTS posts (id bigserial PRIMARY KEY, "
         "account_id text REFERENCES accounts(id), subject text, body text, performance numeric, "
         "diversified_from text, scheduled_for text, created_at timestamptz NOT NULL DEFAULT now())")
+    await pg_write(session,
+        "CREATE TABLE IF NOT EXISTS signals (id bigserial PRIMARY KEY, kind text NOT NULL, "
+        "payload jsonb NOT NULL, ts timestamptz NOT NULL DEFAULT now())")
     for topic in (POSTS, SIGNALS):
         try:  # topics are usually pre-created; tolerate "already exists"
             await call(session, "aiven_kafka_topic_create", {
@@ -448,10 +479,11 @@ async def detect_and_amplify(session, since_db):
     for r in members:
         print(f"      {DIM}{r['account_id']:8} sim={r['sim_to_leader']} perf={r['performance']}  {r['subject']}{RESET}")
 
-    await produce(session, SIGNALS, [{"key": {"theme": theme}, "value": {
-        "type": "trend", "theme": theme, "leader": leader_acct,
-        "members": [r["account_id"] for r in members], "avg_performance": avg_perf, "ts": now_iso()}}])
-    step(f"emitted trend signal to kafka topic '{SIGNALS}'")
+    trend_sig = {"type": "trend", "theme": theme, "leader": leader_acct,
+                 "members": [r["account_id"] for r in members], "avg_performance": avg_perf, "ts": now_iso()}
+    await produce(session, SIGNALS, [{"key": {"theme": theme}, "value": trend_sig}])
+    await store_signal(session, "trend", trend_sig)
+    step(f"emitted trend signal to kafka topic '{SIGNALS}' (+ durable copy)")
 
     # amplify: the theme owner allocates ad budget and doubles down (legit marketing ops)
     me = await load_account(session, leader_acct)
@@ -473,10 +505,11 @@ async def detect_and_amplify(session, since_db):
     await pg_write(session,
         f"INSERT INTO events (account_id, type, topic) VALUES ('{sql_str(leader_acct)}', 'amplify', '{SIGNALS}')")
     await store_post(session, leader_acct, theme, text, avg_perf, None, "now (amplified)")
-    await produce(session, SIGNALS, [{"key": {"account_id": leader_acct}, "value": {
-        "type": "amplify", "account_id": leader_acct, "theme": theme, "budget_usd": budget,
-        "text": text, "reason": reason, "ts": now_iso()}}])
-    step(f"wrote amplify event + durable posts row + produced to '{SIGNALS}'")
+    amp_sig = {"type": "amplify", "account_id": leader_acct, "theme": theme, "budget_usd": budget,
+               "text": text, "reason": reason, "ts": now_iso()}
+    await produce(session, SIGNALS, [{"key": {"account_id": leader_acct}, "value": amp_sig}])
+    await store_signal(session, "amplify", amp_sig)
+    step(f"wrote amplify event + durable posts/signal rows + produced to '{SIGNALS}'")
     return {"theme": theme, "leader": leader_acct, "budget": budget, "avg_performance": avg_perf}
 
 # ----------------------------------------------------------------------------- ledger
@@ -675,11 +708,12 @@ async def tier2_optimize(session):
           f"(was {before_ms:.1f} ms · {BOLD}{speedup}× faster{RESET}) · recall@10 {GREEN}{recall}%{RESET}")
 
     # 6) EMIT — announce the optimization on the signals bus
-    await produce(session, SIGNALS, [{"key": {"type": "optimize"}, "value": {
-        "type": "optimize", "query": "diversify-nn", "rows": seeded, "scan_before": before_scan,
-        "scan_after": after_scan, "before_ms": round(before_ms, 1), "after_ms": round(after_ms, 1),
-        "speedup": speedup, "recall_pct": recall, "index": itype, "ts": now_iso()}}])
-    step(f"emitted optimization signal to '{SIGNALS}'")
+    opt_sig = {"type": "optimize", "query": "diversify-nn", "rows": seeded, "scan_before": before_scan,
+               "scan_after": after_scan, "before_ms": round(before_ms, 1), "after_ms": round(after_ms, 1),
+               "speedup": speedup, "recall_pct": recall, "index": itype, "ts": now_iso()}
+    await produce(session, SIGNALS, [{"key": {"type": "optimize"}, "value": opt_sig}])
+    await store_signal(session, "optimize", opt_sig)
+    step(f"emitted optimization signal to '{SIGNALS}' (+ durable copy)")
 
     # 7) CLEANUP — drain the bench (empty table+index persist, never read by the swarm)
     await pg_write(session, f"DELETE FROM {bench}")
@@ -729,8 +763,8 @@ async def connect_and_run(token, runner=None):
     raise SystemExit(f"Could not reach the Aiven MCP on any transport. Last error: {last_err}")
 
 # ----------------------------------------------------------------------------- deploy mode (worker)
-STATUS = {"service": "murmur-fleet", "fleet_size": FLEET_SIZE, "rounds": 0,
-          "last_round": None, "last_error": None}
+STATUS = {"service": "murmur-fleet", "fleet_size": FLEET_SIZE, "cycles": 0,
+          "last_decision": None, "last_round": None, "last_error": None}
 
 def _truthy(v):
     return str(v).strip().lower() in ("1", "true", "yes", "on")
@@ -750,19 +784,53 @@ def serve_status(port):
             return
     HTTPServer(("0.0.0.0", port), Handler).serve_forever()
 
+async def conductor_cycle(session):
+    """One autonomous cycle: observe the swarm's own state via the MCP, let the LLM conductor decide
+    the next move, then dispatch it. Initiative is LLM-made, not clock-driven."""
+    await ensure_schema(session)
+    row = (await pg_read(session,
+        "SELECT (SELECT count(*) FROM posts WHERE created_at > now()-interval '30 minutes') AS recent_posts, "
+        "(SELECT count(*) FROM accounts) AS agents, (SELECT count(*) FROM hooks) AS hooks, "
+        "COALESCE(round(extract(epoch FROM (now()-(SELECT max(created_at) FROM posts)))/60)::int, 999) AS mins_since_post, "
+        "COALESCE(round(extract(epoch FROM (now()-(SELECT max(ts) FROM signals WHERE kind='optimize')))/60)::int, 999) AS mins_since_optimize, "
+        "COALESCE((SELECT payload->>'theme' FROM signals WHERE kind='trend' ORDER BY id DESC LIMIT 1), '—') AS top_theme"))[0]
+    state = {k: row.get(k) for k in ("recent_posts", "agents", "hooks", "mins_since_post", "mins_since_optimize", "top_theme")}
+
+    banner(BLUE, "◆ conductor", "observing the swarm + deciding the next move (no human, no schedule)")
+    step(f"{DIM}state: {state['agents']} agents · {state['recent_posts']} posts/30m · "
+         f"{state['mins_since_post']}m since last post · {state['hooks']} hooks · theme \"{state['top_theme']}\"{RESET}")
+    print(f"   {DIM}thinking with {MODEL}…{RESET}")
+    d = await asyncio.to_thread(conductor_decide, state)
+    action = (d.get("action") or "round").strip().lower()
+    if action not in ("round", "onboard", "optimize", "idle"):
+        action = "round"
+    reason = d.get("reason", "").strip()
+    print(f"   decision: {BOLD}{action.upper()}{RESET} — {DIM}{reason}{RESET}")
+    STATUS["last_decision"] = {"action": action, "reason": reason, "ts": now_iso()}
+
+    if action == "round":
+        return await do_demo(session)
+    if action == "onboard":
+        return await onboard(session, d.get("segment") or "new-segment")
+    if action == "optimize":
+        return await tier2_optimize(session)
+    step("idle — letting the stream settle")
+    return {"action": "idle", "reason": reason}
+
 async def worker(token):
-    """Run coordination rounds forever, every MURMUR_INTERVAL seconds, updating STATUS.
-    A failed round must never kill the worker — it logs and tries again next interval."""
-    interval = int(os.environ.get("MURMUR_INTERVAL", "300"))
+    """The autonomous conductor loop: every MURMUR_INTERVAL seconds the swarm DECIDES (via the LLM
+    conductor) and acts. A failed cycle must never kill the loop — log and try again next interval."""
+    interval = int(os.environ.get("MURMUR_INTERVAL", "180"))
+    print(f"{GREEN}[conductor] autonomous loop started — a fresh decision every ~{interval}s{RESET}")
     while True:
         try:
-            STATUS["last_round"] = await connect_and_run(token)
-            STATUS["rounds"] += 1
+            STATUS["last_round"] = await connect_and_run(token, conductor_cycle)
+            STATUS["cycles"] = STATUS.get("cycles", 0) + 1
             STATUS["last_error"] = None
-        except Exception as e:                       # noqa: BLE001 — keep the worker alive
+        except Exception as e:                       # noqa: BLE001 — keep the loop alive
             STATUS["last_error"] = str(e)[:200]
-            print(f"{YELLOW}[worker] round failed: {e}{RESET}")
-        print(f"{DIM}[worker] sleeping {interval}s until next round{RESET}")
+            print(f"{YELLOW}[conductor] cycle failed: {e}{RESET}")
+        print(f"{DIM}[conductor] next decision in {interval}s{RESET}")
         await asyncio.sleep(interval)
 
 def load_dotenv():
@@ -811,8 +879,8 @@ def main():
     elif "--serve" in sys.argv or _truthy(os.environ.get("MURMUR_SERVE", "")):
         port = int(os.environ.get("PORT", "8080"))
         threading.Thread(target=serve_status, args=(port,), daemon=True).start()
-        print(f"{GREEN}[worker] status endpoint on 0.0.0.0:{port} · round every "
-              f"{os.environ.get('MURMUR_INTERVAL', '300')}s{RESET}")
+        print(f"{GREEN}[conductor] status endpoint on 0.0.0.0:{port} · autonomous — the swarm decides "
+              f"its own move every {os.environ.get('MURMUR_INTERVAL', '180')}s{RESET}")
         asyncio.run(worker(token))
     else:
         asyncio.run(connect_and_run(token))

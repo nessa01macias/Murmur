@@ -317,6 +317,62 @@ def _get_ops(cur, tables, posts, posts_live):
             "budget_total": budget_total, "source": source}
 
 
+def _get_signals(cur, tables, limit=14):
+    """Recent autonomous signals (trend / amplify / optimize) the agents persisted to the
+    `signals` table. Each row's `payload` is jsonb → already a dict via psycopg. (rows, source)."""
+    if "signals" not in tables:
+        return [], "none"
+    cur.execute("SELECT kind, payload, ts FROM signals ORDER BY id DESC LIMIT %s", (limit,))
+    rows = [{"kind": r["kind"], "payload": r["payload"], "ts": _iso(r["ts"])} for r in cur.fetchall()]
+    return rows, ("live" if rows else "empty")
+
+
+def _get_diversity(cur, tables):
+    """Live pgvector readout. For each hook (latest per account+subject) find the nearest
+    peer hook from ANOTHER account within the same ~round window, and return the cosine
+    similarity — the EXACT metric the agents diversify on, recomputed live in Postgres so
+    the feed can show real numbers. Lower sim = more distinct. The 20-minute window scopes
+    it to the round the agent actually diversified against (not all-time near-dupes).
+
+    Read-only; returns {} if hooks/pgvector aren't present. Keyed by (account_id, subject)
+    so it maps cleanly onto `posts` rows in get_state()."""
+    if "hooks" not in tables:
+        return {}
+    try:
+        cur.execute(
+            """
+            WITH h AS (
+              SELECT account_id, subject, embedding, ts,
+                     row_number() OVER (PARTITION BY account_id, subject ORDER BY ts DESC) AS rn
+              FROM hooks
+            )
+            SELECT h.account_id, h.subject,
+                   n.account_id AS near, n.subject AS near_subject, n.sim
+            FROM h
+            LEFT JOIN LATERAL (
+              SELECT o.account_id, o.subject,
+                     round((1 - (h.embedding <=> o.embedding))::numeric, 3)::float8 AS sim
+              FROM hooks o
+              WHERE o.account_id <> h.account_id
+                AND o.ts BETWEEN h.ts - interval '20 minutes' AND h.ts + interval '20 minutes'
+              ORDER BY h.embedding <=> o.embedding
+              LIMIT 1
+            ) n ON true
+            WHERE h.rn = 1
+            """
+        )
+        out = {}
+        for r in cur.fetchall():
+            out[(r["account_id"], r["subject"])] = {
+                "near": r["near"],
+                "near_subject": r["near_subject"],
+                "sim": float(r["sim"]) if r["sim"] is not None else None,
+            }
+        return out
+    except Exception:  # noqa: BLE001 — diversity is a bonus readout; never break the poll
+        return {}
+
+
 # ------------------------------------------------------------------------ public API
 def get_state(limit=60):
     """The whole payload the dashboard polls. Never raises — on any DB error it
@@ -346,7 +402,14 @@ def get_state(limit=60):
             accounts = _get_accounts(cur) if "accounts" in tables else _mock_accounts()
             accounts_src = "live" if "accounts" in tables else "mock (no accounts table)"
             posts, posts_src = _get_posts(cur, tables, limit)
+            # live pgvector diversity: attach each post's real cosine to its nearest peer hook
+            div = _get_diversity(cur, tables) if posts_src == "live" else {}
+            for p in posts:
+                d = div.get((p.get("account_id"), p.get("subject")))
+                if d:
+                    p["sim"], p["near"], p["near_subject"] = d["sim"], d["near"], d["near_subject"]
             ops = _get_ops(cur, tables, posts, posts_live=posts_src == "live")
+            signals, signals_src = _get_signals(cur, tables)
             return {
                 "generated_at": generated_at,
                 "mode": "live",
@@ -354,7 +417,10 @@ def get_state(limit=60):
                 "accounts": accounts,
                 "posts": posts,
                 "ops": ops,
-                "sources": {"accounts": accounts_src, "posts": posts_src, "ops": ops["source"]},
+                "signals": signals,
+                "sources": {"accounts": accounts_src, "posts": posts_src,
+                            "ops": ops["source"], "signals": signals_src,
+                            "diversity": "live (pgvector)" if div else "none"},
             }
     except Exception as e:  # noqa: BLE001 — viewer must stay up; show degraded state
         accounts = _mock_accounts()

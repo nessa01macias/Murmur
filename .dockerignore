@@ -5,6 +5,5 @@
 .gitignore
 __pycache__/
 *.pyc
-dashboard/
 mcp-aiven/
 *.md

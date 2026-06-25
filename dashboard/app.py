@@ -44,6 +44,9 @@ def state():
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("MURMUR_PORT", "5050"))
-    # host stays loopback — this is a local demo viewer, not a public service.
-    app.run(host="127.0.0.1", port=port, debug=False)
+    # Local default: loopback + auto-reload. In a container (Hugging Face Spaces etc.) set
+    # HOST=0.0.0.0, PORT=<public port, e.g. 7860>, FLASK_DEBUG=0 to serve publicly.
+    host = os.environ.get("HOST", "127.0.0.1")
+    port = int(os.environ.get("PORT") or os.environ.get("MURMUR_PORT") or "5050")
+    debug = os.environ.get("FLASK_DEBUG", "1") not in ("0", "false", "no", "")
+    app.run(host=host, port=port, debug=debug)
